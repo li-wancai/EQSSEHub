@@ -98,6 +98,12 @@ func (p *PusherN) safeCloseDoneChan(cc *clientConn) {
 	}
 	// 状态已为"已关闭"（1）时：直接返回，避免重复关闭
 }
+func (p *PusherN) safeCloseSendChan(cc *clientConn) {
+	if atomic.CompareAndSwapUint32(&cc.closed, 0, 1) {
+		close(cc.sendChan) // 首次关闭：安全执行
+		log.Debugf("客户端连接已关闭, connID=%s", genConnID(cc.ctx))
+	}
+}
 
 // JoinRoom 客户端加入房间
 func (p *PusherN) JoinRoom(c *gin.Context, roomID string) {
@@ -127,7 +133,7 @@ func (p *PusherN) JoinRoom(c *gin.Context, roomID string) {
 	defer func() {
 		rcMap.Delete(connID)
 		atomic.AddUint64(&onlineConnCount, ^uint64(0)) // 原子减1
-		close(cc.sendChan)                             // 关闭消息发送通道（仅关闭一次，无重复风险）
+		p.safeCloseSendChan(cc)                        // 关闭消息发送通道（仅关闭一次，无重复风险）
 		p.safeCloseDoneChan(cc)                        // 安全关闭doneChan（核心优化）
 		// 清理空房间
 		empty := true
