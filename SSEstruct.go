@@ -32,11 +32,12 @@ func genEventID(baseID string) string {
 
 // 客户端连接结构体
 type clientConn struct {
-	ctx      *gin.Context
-	lastAct  int64           // 最后活跃时间（毫秒时间戳）
-	sendChan chan *sse.Event // 消息发送通道（无缓冲）
-	doneChan chan struct{}   // 关闭信号通道
-	closed   uint32          // 通道关闭状态标记（0:未关闭，1:已关闭）- 新增状态标记
+	ctx        *gin.Context
+	lastAct    int64
+	sendChan   chan *sse.Event
+	doneChan   chan struct{}
+	closedSend uint32 // sendChan关闭标志
+	closedDone uint32 // doneChan关闭标志
 }
 
 // 推送器

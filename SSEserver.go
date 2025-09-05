@@ -91,17 +91,15 @@ func genConnID(c *gin.Context) string {
 // safeCloseDoneChan 安全关闭doneChan（核心优化：避免重复关闭）
 // 通过原子操作CAS判断状态，确保通道仅被关闭一次
 func (p *PusherN) safeCloseDoneChan(cc *clientConn) {
-	// CAS操作：仅当状态为"未关闭"（0）时，更新为"已关闭"（1）
-	if atomic.CompareAndSwapUint32(&cc.closed, 0, 1) {
-		close(cc.doneChan) // 首次关闭：安全执行
-		log.Debugf("客户端连接已关闭, connID=%s", genConnID(cc.ctx))
+	if atomic.CompareAndSwapUint32(&cc.closedDone, 0, 1) {
+		close(cc.doneChan)
+		log.Debugf("客户端doneChan已关闭, connID=%s", genConnID(cc.ctx))
 	}
-	// 状态已为"已关闭"（1）时：直接返回，避免重复关闭
 }
 func (p *PusherN) safeCloseSendChan(cc *clientConn) {
-	if atomic.CompareAndSwapUint32(&cc.closed, 0, 1) {
-		close(cc.sendChan) // 首次关闭：安全执行
-		log.Debugf("客户端连接已关闭, connID=%s", genConnID(cc.ctx))
+	if atomic.CompareAndSwapUint32(&cc.closedSend, 0, 1) {
+		close(cc.sendChan)
+		log.Debugf("客户端sendChan已关闭, connID=%s", genConnID(cc.ctx))
 	}
 }
 
@@ -133,8 +131,8 @@ func (p *PusherN) JoinRoom(c *gin.Context, roomID string) {
 	defer func() {
 		rcMap.Delete(connID)
 		atomic.AddUint64(&onlineConnCount, ^uint64(0)) // 原子减1
-		p.safeCloseSendChan(cc)                        // 关闭消息发送通道（仅关闭一次，无重复风险）
 		p.safeCloseDoneChan(cc)                        // 安全关闭doneChan（核心优化）
+		p.safeCloseSendChan(cc)                        // 关闭消息发送通道（仅关闭一次，无重复风险）
 		// 清理空房间
 		empty := true
 		rcMap.Range(func(_, _ interface{}) bool {
@@ -171,6 +169,8 @@ func (p *PusherN) PushToRoom(roomID string, stockEvent *sse.Event) error {
 	rcMap.Range(func(_, val interface{}) bool {
 		cc := val.(*clientConn)
 		select {
+		case <-cc.doneChan:
+			// 客户端已关闭，跳过
 		case cc.sendChan <- stockEvent:
 			atomic.AddUint64(&totalPushCount, 1)
 			atomic.StoreInt64(&cc.lastAct, time.Now().UnixMilli()) // 更新活跃时间
@@ -178,8 +178,7 @@ func (p *PusherN) PushToRoom(roomID string, stockEvent *sse.Event) error {
 			// 慢客户端：超过阈值未接收，主动关闭
 			p.safeCloseDoneChan(cc) // 安全关闭doneChan（核心优化）
 			log.Warnf("自动清理慢客户端, roomID=%s, connID=%s", roomID, cc.ctx.ClientIP())
-		case <-cc.doneChan:
-			// 客户端已关闭，跳过
+
 		}
 		return true
 	})
@@ -193,12 +192,13 @@ func (p *PusherN) BatchPushToRoom(roomID string, events []*sse.Event) error {
 		// 没客户的房间会自动清除，房间不存在，忽略推送
 		return nil
 	}
-
 	rcMap := roomConnMap.(*sync.Map)
 	rcMap.Range(func(_, val interface{}) bool {
 		cc := val.(*clientConn)
 		for _, event := range events {
 			select {
+			case <-cc.doneChan:
+				return false
 			case cc.sendChan <- event:
 				atomic.AddUint64(&totalPushCount, 1)
 				atomic.StoreInt64(&cc.lastAct, time.Now().UnixMilli())
@@ -206,8 +206,7 @@ func (p *PusherN) BatchPushToRoom(roomID string, events []*sse.Event) error {
 				p.safeCloseDoneChan(cc) // 安全关闭doneChan（核心优化）
 				log.Warnf("自动清理慢客户端, roomID=%s, connID=%s", roomID, cc.ctx.ClientIP())
 				return false // 退出当前客户端的批量推送
-			case <-cc.doneChan:
-				return false
+
 			}
 		}
 		return true
@@ -222,13 +221,15 @@ func (p *PusherN) Broadcast(stockEvent *sse.Event) {
 		rcMap.Range(func(_, connVal interface{}) bool {
 			cc := connVal.(*clientConn)
 			select {
+			case <-cc.doneChan:
+
 			case cc.sendChan <- stockEvent:
 				atomic.AddUint64(&totalPushCount, 1)
 				atomic.StoreInt64(&cc.lastAct, time.Now().UnixMilli())
 			case <-time.After(p.slowClientThreshold):
 				p.safeCloseDoneChan(cc) // 安全关闭doneChan（核心优化）
 				log.Warnf("自动清理慢客户端, roomID=%s, connID=%s", roomID, cc.ctx.ClientIP())
-			case <-cc.doneChan:
+
 			}
 			return true
 		})
@@ -282,17 +283,22 @@ func (p *PusherN) startHeartbeat(cc *clientConn) {
 	for {
 		select {
 		case <-ticker.C:
-			// 发送心跳消息（空data标识）
 			heartbeatEvent := &sse.Event{
 				Event: "heartbeat",
 				Data:  "",
-				Retry: uint(p.heartbeatInterval.Milliseconds()), // 告知客户端重连间隔
+				Retry: uint(p.heartbeatInterval.Milliseconds()),
 			}
+			select {
+			case <-cc.doneChan:
+				return
+			default:
+			}
+			// 检查 sendChan 是否已关闭
 			select {
 			case cc.sendChan <- heartbeatEvent:
 				atomic.StoreInt64(&cc.lastAct, time.Now().UnixMilli())
 			case <-time.After(p.slowClientThreshold):
-				p.safeCloseDoneChan(cc) // 安全关闭doneChan（核心优化）
+				p.safeCloseDoneChan(cc)
 				log.Warnf("自动清理慢客户端, connID=%s", cc.ctx.ClientIP())
 				return
 			case <-cc.doneChan:
